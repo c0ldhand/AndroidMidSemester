@@ -8,6 +8,8 @@ import io.github.dekabrsky.androidMidSemester.data.api.dto.SeasonDto
 import io.github.dekabrsky.androidMidSemester.data.api.dto.SingleEnvelope
 import io.github.dekabrsky.androidMidSemester.data.api.dto.TeamDto
 import io.github.dekabrsky.androidMidSemester.data.cache.MatchesCache
+import io.github.dekabrsky.androidMidSemester.domain.model.Team
+import io.github.dekabrsky.androidMidSemester.domain.repository.TeamRepository
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
@@ -24,7 +26,10 @@ class MatchRepositoryImplTest {
     private val date = LocalDate.of(2026, 10, 13)
     private val api = FakeApi()
     private val cache = MatchesCache()
-    private val repository = MatchRepositoryImpl(api, cache)
+    private val teams = object : TeamRepository {
+        override suspend fun teamsFrom(country: String) = listOf(Team(1, "Home", null), Team(2, "Away", null))
+    }
+    private val repository = MatchRepositoryImpl(api, cache, teams)
 
     @Test
     fun `returning to a visited date uses its cached matches`() = runBlocking {
@@ -89,7 +94,7 @@ class MatchRepositoryImplTest {
     @Test
     fun `another repository instance reuses the application cache`() = runBlocking {
         val result = repository.matchesOn(date)
-        val anotherRepository = MatchRepositoryImpl(api, cache)
+        val anotherRepository = MatchRepositoryImpl(api, cache, teams)
 
         assertSame(result, anotherRepository.matchesOn(date))
         assertEquals(listOf(date.toString()), api.requestedDates)
@@ -98,10 +103,40 @@ class MatchRepositoryImplTest {
     @Test
     fun `a new application cache loads the date again`() = runBlocking {
         repository.matchesOn(date)
-        val anotherRepository = MatchRepositoryImpl(api, MatchesCache())
+        val anotherRepository = MatchRepositoryImpl(api, MatchesCache(), teams)
         anotherRepository.matchesOn(date)
 
         assertEquals(listOf(date.toString(), date.toString()), api.requestedDates)
+    }
+
+    @Test
+    fun `server query includes every Russian team ID`() = runBlocking {
+        repository.matchesOn(date)
+
+        assertEquals(listOf("1,2"), api.requestedTeamIds)
+        assertEquals(listOf(0), api.offsets)
+    }
+
+    @Test
+    fun `all pages are loaded once before caching a day`() = runBlocking {
+        api.responses[date.toString()] = (1L..1001L).map { game(it) }
+
+        val result = repository.matchesOn(date)
+
+        assertEquals(1001, result.size)
+        assertSame(result, repository.matchesOn(date))
+        assertEquals(listOf(0, 1000), api.offsets)
+    }
+
+    @Test
+    fun `an empty country does not accidentally request worldwide matches`() = runBlocking {
+        val noTeams = object : TeamRepository {
+            override suspend fun teamsFrom(country: String) = emptyList<Team>()
+        }
+        val repository = MatchRepositoryImpl(api, cache, noTeams)
+
+        assertTrue(repository.matchesOn(date).isEmpty())
+        assertTrue(api.requestedDates.isEmpty())
     }
 
     private fun game(id: Long) = GameDto(
@@ -118,18 +153,25 @@ class MatchRepositoryImplTest {
 
     private class FakeApi : SStatsApi {
         val requestedDates = mutableListOf<String>()
+        val requestedTeamIds = mutableListOf<String>()
+        val offsets = mutableListOf<Int>()
         val responses = mutableMapOf<String, List<GameDto>>()
         var failure: IOException? = null
         var beforeResponse: suspend () -> Unit = {}
 
-        override suspend fun gamesOn(date: String): ListEnvelope<GameDto> {
+        override suspend fun gamesOn(date: String, teamIds: String, offset: Int, limit: Int): ListEnvelope<GameDto> {
             requestedDates += date
+            requestedTeamIds += teamIds
+            offsets += offset
             beforeResponse()
             failure?.let { throw it }
-            return ListEnvelope(status = "OK", data = responses[date].orEmpty())
+            return ListEnvelope(status = "OK", data = responses[date].orEmpty().drop(offset).take(limit))
         }
 
         override suspend fun game(id: Long): SingleEnvelope<GameDto> =
             error("Match details are not requested by these tests")
+
+        override suspend fun teams(country: String, offset: Int, limit: Int): ListEnvelope<TeamDto> =
+            error("Teams are supplied by the fake repository")
     }
 }
